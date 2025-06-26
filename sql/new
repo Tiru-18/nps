@@ -1,0 +1,690 @@
+
+create temp table throttle as
+select coalesce(mrn,6000000000000)      current_seq,
+       coalesce(mrn + 1,6000000000000)  next_seq
+  from (
+         select max(mrn) mrn
+           from skyuk-uk-spine-prod-layer-prod.uk_tmp_cust_spine_extracts_is.final_nps_survey_extract_hist_copy
+          where parse_date('%d/%m/%Y',call_date) = current_date()-2);
+
+
+create temp table p1 as 
+select distinct cast(direa.interaction_id as string) src_system_id,
+       'Interactions' source,
+       ba.account_number,
+	   ord.order_id order_id,
+       case when lower(direa.service_call_type_employed) like '%dial%' -- why coalesce '?' (removed). Migration Legacy
+            then 'Outbound Dialler' 
+            when lower(direa.service_call_type_employed) like '%sct%' -- why coalesce '?' (removed). Migration Legacy
+            then 'Inbound' 
+            else 'Outbound' 
+        end activity_type,
+       case when direa.service_group_2 like 'SG2_SER%FST%' 
+            then 'Field Support Team'
+            when direa.service_group_2 like 'SG2_NOW_%SAL%' -- re-ordered as was previously below 'SG2%SAL%' so never triggered. Migration Legacy
+            then 'Now Sales'
+            when direa.service_group_2 like 'SG2_NOW_%SER%' -- re-ordered as was previously below 'SG2%SER%' so never triggered. Migration Legacy
+            then 'Now Service'
+            when direa.service_group_2 like 'SG2%SAL%' 
+            then 'Sales'
+            when direa.service_group_2 like 'SG2%SER%' 
+            then 'Service'
+            when direa.service_group_2 like 'SG2%_CP_%' -- remove 'UK' approx 450 calls per day. Migration Legacy
+            then 'Customer Priority - Service'
+            when direa.service_group_2 like 'SG2_SkyStore%' 
+            then 'Sky Store'
+            when direa.service_group_2 like 'SG2_SKYCMS%' 
+            then 'SKYCMS'
+            when direa.service_group_2 like 'SG2_BUS%' 
+            then 'BUS'
+            --when direa.service_call_type_employed like '%DIAL%' and direa.total_resource_talk_duration > 120 -- include if want to survey connected dialler calls longer than X
+            --then 'Dialler > 120'
+            when direa.service_call_type_employed like '%DIAL%SAL%' 
+            then 'Dialler Sales 1'
+            when direa.service_call_type_employed like '%DIAL%SAV%' 
+            then 'Dialler Sales 2'
+            when direa.service_call_type_employed like '%DIAL%' 
+            then 'Dialler Service'
+            when lower(direa.skill_group) like '%ser%' -- make lower case match - less than 10 per day. Migration Legacy
+            then 'Outbound Service 1'
+            when direa.skill_group like '%HLP%BuyKeep%' -- re-ordered as was previously below '%HLP%' so never triggered. Migration Legacy
+            then 'Outbound Sales 1'
+            when direa.skill_group like '%HLP%' 
+            then 'Outbound Service 2'
+            when lower(direa.skill_group) like '%sal%' -- make lower case match. approx 150 per day. Migration Legacy                       
+            then 'Outbound Sales 2'
+            when direa.skill_group like '%Save%' 
+            then 'Outbound Sales 3'
+            when direa.skill_group like '%Sell%'
+            then 'Outbound Sales 4'
+            when direa.skill_group like '%Welcome%' -- New SKG. Migration Legacy
+            then 'Outbound Sales 5'
+            when direa.skill_group like '%Platform%' -- New SKG. Migration Legacy
+            then 'Outbound Sales 6'
+            when direa.skill_group like '%Loyalty%' -- New SKG. Migration Legacy
+            then 'Outbound Sales 7'
+            when direa.skill_group like '%Case_Investigation%' -- New SKG. Migration Legacy
+            then 'Case_Investigation - Service'
+            else 'Other' 
+        end survey_type,
+       direa.resource_event_start_dt,
+       direa.resource_event_end_dt,
+       direa.resource_name,
+       direa.service_call_type_employed sct,
+       direa.service_group_2,
+       direa.skill_group -- could delete if exclusion clause in P5 moved to P1 as not used in later steps. Migration Legacy
+  from skyuk-uk-customer-pres-prod.uk_pub_cust_interaction_is.fact_interaction_event fia
+ inner join `skyuk-uk-customer-pres-prod.uk_pub_cust_interaction_is.dim_interaction_resource_event_activity` direa 
+    on fia.id = direa.interaction_id
+ inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_contactor c 
+    on (    c.party_id = fia.party_id 
+        and c.effective_to_dt  ='2999-12-31 23:59:59 UTC' )
+ inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_role pr   
+    on (    pr.party_id = fia.party_id 
+        and pr.effective_to_dt  ='2999-12-31 23:59:59 UTC' 
+        and pr.customer_contactor_type = 'Customer' )
+ inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_cust_contactor_role cr   
+     on cr.party_role_id = pr.id
+ inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_account_is.fact_account ba 
+    on (    ba.portfolio_id = cr.portfolio_id 
+        and ba.account_type in ('CORE','MOBILE','SOIP')
+        and case when lower(direa.service_group_2) like '%mob%' or lower(direa.service_call_type_employed) like '%mob%' 
+                 then 'MOBILE' 
+                 when lower(direa.service_group_2) like '%stream%' or lower(direa.service_group_2) like '%glass%' or lower(direa.service_call_type_employed) like '%glass%' or lower(direa.service_call_type_employed) like '%stream%' 
+                 then 'SOIP'
+                 else 'CORE' 
+             end = ba.account_type)
+ left join (select rtm.*,dol.account_number,dol.created_dt from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.dim_order_line dol
+         inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.fact_order fo
+         on dol.order_id=fo.id
+         inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.dim_order_route_to_market rtm 
+     on (    rtm.order_id = fo.id 
+         and rtm.rtm_level_1 != 'Digital' )
+		 where (     ((fo.first_order_flag and rtm.rtm_level_1 ='Direct')))
+		 )ord
+		 on ba.account_number        = ord.account_number 
+         and (ord.created_dt between fia.interaction_start_dt 
+         and timestamp(date_add(date(fia.interaction_end_dt), interval 1 day)))
+ where fia.interaction_start_date = date_sub(current_date(), interval 1 day)
+   and direa.resource_type = 'Agent'
+   and direa.customer_talk_duration > 60
+   and fia.party_id is not null
+   and direa.activity_result = 'Ended'; 
+------------------------------------------------------------------------------------------------------------------------
+-- Fetching data from "Orders" source
+------------------------------------------------------------------------------------------------------------------------
+create temp table p2 as
+select distinct 'Orders' source,
+       dol.account_number,
+       rtm.order_id,
+       case when rtm.rtm_level_1 = 'Direct'
+            then 'New Customer Direct Sale' 
+            else 'Retail Sale' 
+        end activity_type, -- Changed from order ID. Migration Legacy
+       case when rtm.rtm_level_1 in ( 'Retail'/*,'Homes & Indies'*/) -- Added Homes & Indies and re-ordered (re-commented out as will mis-label as Service until actual survey code created)
+            then 'Orders Retail'
+            when direa.service_group_2 like 'SG2%SER%' and rtm.rtm_level_1 = 'Direct' -- Changed from RTM level 2 to SG2 of call. NPS002
+            then 'Orders Service'
+            when direa.service_group_2 like 'SG2%_CP_%' and rtm.rtm_level_1 = 'Direct' -- Changed from RTM level 2 to SG2 of call. NPS002
+            then 'Orders Service'
+            else 'Orders Sales' 
+        end survey_type,                           
+       fo.created_dt,
+       case when rtm.rtm_level_1 in ( 'Retail'/*,'Homes & Indies'*/) and fo.retail_agent_user_id is not null -- Added Homes & Indies and 'not null'
+            then fo.retail_agent_user_id
+            else fo.created_by_id 
+        end resource_name,
+       rtm.rtm_level_1 ,
+       rtm.rtm_level_2,
+       rtm.rtm_level_3 -- could delete if exclusion clause moved to P1 as not used in later steps. Migration Legacy
+   from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.fact_order fo
+  inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.dim_order_route_to_market rtm 
+     on (    rtm.order_id = fo.id 
+         and rtm.rtm_level_1 != 'Digital' )
+  inner join (select distinct order_id,account_number from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.dim_order_line) dol 
+     on fo.id = dol.order_id 
+  inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_account_is.fact_account fa
+     on fa.account_number = dol.account_number
+  left outer join skyuk-uk-customer-pres-prod.uk_pub_cust_interaction_is.dim_interaction_resource_event_activity direa 
+     on direa.resource_name = fo.created_by_id and fo.created_dt between direa.resource_event_start_dt and direa.resource_event_end_dt   
+
+  where (     date(fo.created_dt) = date_sub(current_date(),interval 1 day)
+          and ((fo.first_order_flag and rtm.rtm_level_1 ='Direct')
+		  and rtm.order_id not in (select order_id from p1 where order_id is not null)
+           or (rtm.rtm_level_1 in ('Retail'/*, 'Homes & Indies'*/) and rtm.rtm_level_2 != 'STS Engineers'))) -- Added Homes & Indies
+ qualify row_number() over( partition by fo.id order by case when fa.account_type ='SOIP' then 1 when fa.account_type='CORE' then 2 when fa.account_type='MOBILE' then 3 else 4 end asc, fa.created_dt desc) =1;
+                               
+------------------------------------------------------------------------------------------------------------------------
+-- Fetching data from "Visits" source
+------------------------------------------------------------------------------------------------------------------------
+create temp table p3 as
+select distinct dv.fms_job_reference,
+       'Visits' source,
+       fo.account_number,
+       fv.job_type activity_type,
+       fv.job_type survey_type,
+       case when (dvea.external_resource_id like 'HNI%' or dvea.external_resource_id like 'NI%')
+            then dvs.effective_from_dt
+            when fo.currency='GBP' 
+            then dvea.event_dt
+            when fo.currency='EURO'
+            then dvs.effective_from_dt
+        end even_dt,
+       dvea.external_resource_id, -- replaced nt_login, more complete field. NPS001/2
+       dvea.provider_owner_name, -- replaced external_resource_id (maps to SCT). NPS001/2
+       dve.parent_level_1_owner_name, -- replaced provider_owner_name (maps to SG1). NPS001/2
+       cast(null as string)                job_description -- could delete if exclusion clause moved to P1 as not used in later steps (maps to SKG). Migration Legacy
+  from skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.fact_visit_requirement fv
+---------------------------------------------------------------- Section changed to address wrong visit identified where duplicate jobs exist. Engineer Survey Fix
+ inner join skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit dv 
+    on dv.visit_requirement_id = fv.id
+ inner join `skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit_event_activity` dvea 
+    on (     dvea.visit_requirement_id = fv.id  )
+ inner join (select visit_requirement_id,
+                    fms_job_reference,  
+                    effective_to_dt,
+                    status_code,
+                    effective_from_dt,
+                    case when status='Complete'
+                         then'complete'
+                         when status='Incomplete'
+                         then'notdone'
+                         when status='Cancelled'
+                         then'cancelled'
+                         else status 
+                     end latest_status
+               from 
+               (select vs.visit_requirement_id, vs.effective_to_dt, vs.status_code, vs.effective_from_dt, vs.status, vs.last_modified_dt, dv.fms_job_reference
+               from skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit_status vs
+               inner join skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit dv 
+               on dv.visit_requirement_id = vs.visit_requirement_id and dv.effective_to_dt = vs.effective_to_dt)               
+            qualify row_number()over(partition by fms_job_reference order by last_modified_dt desc)=1) dvs
+    on (     dvs.fms_job_reference = dv.fms_job_reference
+         and dvs.effective_to_dt  ='2999-12-31 23:59:59 UTC' 
+         and dvs.status_code = 'CP' 
+         and date(dvs.effective_from_dt)=date_sub(current_date(), interval 1 day))
+  left join skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit_activity dva
+     on dvs.fms_job_reference=dva.fms_job_reference
+        and dva.work_type_group='Customer'
+        and dva.activity_status!='suspended'
+----------------------------------------------------------------- amended section ends. Engineer Survey Fix
+ inner join skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit_engineer dve 
+    on (    coalesce(dve.resource_external_id,dva.resource_external_id) = dvea.external_resource_id 
+        and dve.effective_to_dt  ='2999-12-31 23:59:59 UTC' )
+ inner join (select fo.id,
+                    dol.account_number,
+                    fo.currency
+              from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.fact_order fo 
+             inner join ( select distinct order_id ,
+                                          account_number 
+                            from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_order_is.dim_order_line ) dol
+                on dol.order_id = fo.id 
+             inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_account_is.fact_account fa 
+                on fa.account_number = dol.account_number 
+            qualify row_number() over( partition by fo.id 
+                                           order by case when fa.account_type='SOIP' 
+                                                         then 1 
+                                                         when fa.account_type='CORE' 
+                                                         then 2 
+                                                         when fa.account_type='MOBILE' 
+                                                         then 3 
+                                                         else 4  
+                                                     end asc,fa.created_dt desc)=1 )fo
+    on (     fo.id = fv.order_id
+         and case when (dvea.external_resource_id like 'HNI%' or dvea.external_resource_id like 'NI%')
+                  then date(dvs.effective_from_dt)=date_sub(current_date(), interval 1 day)
+                  when fo.currency         = 'GBP' 
+                  then date(dvea.event_dt) = date_sub(current_date(), interval 1 day)
+                  when fo.currency         = 'EURO' 
+                  then date(dvs.effective_from_dt)=date_sub(current_date(), interval 1 day)
+              end      )
+ where (   fv.job_type in ('Service','Install','Moving Home')
+        and dv.fms_job_reference is not null 
+        and case when lower(dva.activity_status) in ('pending','enroute','started') then lower(dvs.latest_status) else lower(dva.activity_status) end ='complete')
+ qualify rank() over (partition by fv.id order by even_dt asc, dvea.external_resource_id)=1; -- removed nt_login from order by. NPS001
+
+
+------------------------------------------------------------------------------------------------------------------------
+-- Combining data from all 3 sources
+------------------------------------------------------------------------------------------------------------------------
+create temp table p4 as
+select p1.src_system_id,
+       p1.source,
+       p1.account_number,
+       p1.activity_type,
+       p1.survey_type,
+       p1.resource_event_start_dt ,
+       p1.resource_event_end_dt ,
+       p1.resource_name ,
+       p1.sct,
+       p1.service_group_2,
+       p1.skill_group -- could delete if P5 exclusion clause moved to P1 as not used in later steps. Migration Lagacy
+  from  p1
+ union all
+ select p2.order_id,  -- changed from null. Migration Lagacy
+        p2.source,
+        p2.account_number,
+        p2.activity_type,  -- changed to Retail/Direct from order ID. Migration Lagacy
+        p2.survey_type,                           
+        p2.created_dt,
+        p2.created_dt,
+        p2.resource_name,
+        p2.rtm_level_1,
+        p2.rtm_level_2,
+        p2.rtm_level_3 -- could delete if P5 exclusion clause moved to P1 as not used in later steps. Migration Lagacy
+   from  p2
+  union all
+ select p3.fms_job_reference,
+        p3.source,
+        p3.account_number,
+        p3.activity_type,
+        p3.survey_type,
+        p3.even_dt,
+        p3.even_dt,
+        p3.external_resource_id,
+        p3.provider_owner_name,
+        p3.parent_level_1_owner_name,
+        p3.job_description -- could delete if P5 exclusion clause moved to P1 as not used in later steps. Migration Lagacy
+   from  p3;
+
+------------------------------------------------------------------------------------------------------------------------
+-- joining p4 with other dim tables, to get customer personal information
+------------------------------------------------------------------------------------------------------------------------
+create temp table p5 as
+select p4.src_system_id, 
+       p4.source,
+       fa.portfolio_id, 
+       p4.account_number, 
+       fa.account_type, 
+       fa.currency_code,
+       case when fa.currency_code='EURO' 
+            then 'ROI'
+            when fa.currency_code='GBP' 
+            then 'UK'
+        end                                  country, 
+       p4.activity_type                      contact_activity,
+       p4.survey_type,
+       coalesce(pd.first_name,pde.first_name,per.forename)  advisor_first_name,
+       coalesce(pd.last_name,pde.last_name,per.surname)    last_name,
+       p4.resource_name                      created_by_id,
+       p4.service_group_2,               
+       p4.sct,
+       p4.skill_group, -- could delete if P5 exclusion clause moved to P1 as not used in later steps. Migration Lagacy
+       p4.resource_event_start_dt,
+       p4.resource_event_end_dt,
+       pd.position, -- not used, delete?. Migration Lagacy
+       coalesce(drh.region_name, pd.directorate, pde.directorate, dve.parent_level_1_owner_name) directorate, -- added retail and eng region. NPS001
+       pd.division, -- not used, delete?. Migration Lagacy
+       coalesce(pd.working_location, pde.working_location, drh.home_store_name) working_location, -- added retail store. NPS001
+       pd.department_costcentre, -- not used, delete?. Migration Lagacy
+       coalesce(drh.team_leader, pd.level_4_manager_name, pde.level_4_manager_name, dve.team_manager) cel, -- added retail and eng leader. NPS001
+       coalesce(drh.regional_manager, pd.level_3_manager_name, pde.level_3_manager_name, dve.regional_manager) cem, -- added retail and eng manager. NPS001
+       pd.level_2_manager_name, -- not used, delete?. Migration Lagacy
+       pe.email_address                      account_primary_email,
+       case when pt.international_dialling_code ='0044' and length(ltrim(pt.combined_number,'0'))=10
+            then concat('44',ltrim(pt.combined_number,'0'))
+            when pt.international_dialling_code ='00353' and length(ltrim(pt.combined_number,'0'))=12
+            then ltrim(pt.combined_number,'0')
+        end account_primary_mobile,
+       pp.title,
+       pp.forename,
+       pp.surname
+  from p4
+  
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_shared_is.dim_personnel pd 
+    on (    pd.nt_login          =  p4.resource_name
+        and pd.effective_from_dt <= p4.resource_event_start_dt 
+        and pd.effective_to_dt   >  p4.resource_event_start_dt 
+        and pd.directorate is not null )
+
+  left outer join `skyuk-uk-customer-pres-prod.uk_pub_customer_retailer_is.dim_retailer_hierarchy` drh -- added join to retail hierarchy using order_dt to align with correct details on date of. NPS001
+    on drh.user_id = p4.resource_name
+    and p4.resource_event_start_dt between drh.effective_from_dt and drh.effective_to_dt
+
+  left join (select pp.forename,
+                    pp.surname,
+                    pp.party_id,
+                    par.user_id 
+               from skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_person pp 
+              inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_role pr 
+                 on (     pp.party_id       = pr.party_id 
+                      and pr.type              = 'Agent' 
+                      and pp.effective_to_dt= '2999-12-31 23:59:59 UTC')
+              inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_agent_role par
+                 on pr.id=par.party_role_id ) per
+  on (     p4.resource_name = per.user_id
+       and p4.source        = 'Orders'
+       and p4.sct           = 'Retail')
+
+  left join `skyuk-uk-customer-pres-prod.uk_pub_customer_visit_is.dim_visit_engineer` dve 
+    on (dve.resource_external_id = p4.resource_name
+        and p4.source = 'Visits'
+        and dve.effective_to_dt  ='2999-12-31 23:59:59 UTC' )
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_shared_is.dim_personnel pde
+    on (    pde.employee_id          =  dve.payroll_id
+        and pde.effective_to_dt = '2999-12-31 23:59:59 UTC')
+
+
+ inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_account_is.fact_account fa 
+    on (    fa.account_number = p4.account_number 
+        and p4.account_number is not null )
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_cust_contactor_role cr 
+     on (    cr.portfolio_id = fa.portfolio_id 
+         and cr.type = 'Customer')
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_role pr 
+    on (     cr.party_role_id = pr.id 
+         and pr.effective_to_dt  ='2999-12-31 23:59:59 UTC' )
+  inner join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_contactor c
+    on (    c.party_id = pr.party_id
+        and c.effective_to_dt  ='2999-12-31 23:59:59 UTC'
+        and coalesce(c.mortality_status_code,'01') = '01'
+        and coalesce(c.type_code,'STD') = 'STD'
+        and coalesce(c.escalation_code,'NE') not in ('TF','EC','ET','CC','KF','EA','FF','EW'))
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_contact_email pce 
+    on (    pce.party_id = pr.party_id 
+        and pce.effective_to_dt  ='2999-12-31 23:59:59 UTC' 
+        and pce.email_role = 'PRIMARY' )
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_email pe
+       on (    pce.email_id = pe.id 
+        and pe.status = 'VALID' )
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_contact_telephone pct 
+    on (    pct.party_id = pr.party_id 
+        and pct.effective_to_dt  ='2999-12-31 23:59:59 UTC'
+        and pct.telephone_role = 'PRIMARY' )
+  left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_telephone pt 
+    on (    pt.id = pct.telephone_id 
+        and pt.use_code = 'V'
+        and ((pt.international_dialling_code ='0044' and (length(ltrim(pt.combined_number,'0')) =10 or length(pt.combined_number)=10) and (pt.combined_number like '07%' or pt.combined_number like '7%')) or  (pt.international_dialling_code ='00353' and ((length(ltrim(pt.combined_number,'0')) =12 or length(pt.combined_number) =12)) and (pt.combined_number like '003538%' or pt.combined_number like '3538%' or pt.combined_number like '8%')))) 
+   left join skyuk-uk-customer-pres-prod.uk_pub_cust_spine_party_is.dim_party_person pp
+     on (    pp.party_id=coalesce(pce.party_id,pct.party_id)
+         and pp.effective_to_dt ='2999-12-31 23:59:59 UTC')
+ where p4.source = 'Visits' or p4.source = 'Orders' 
+  or (p4.source = 'Interactions' and p4.skill_group not like '%HSS%' and p4.sct not like '%SCT_BUS%' and  p4.sct not like '%CMS_%' and lower(p4.sct) not like '%deceased%' and p4.sct not like '%HSSFST%'and p4.sct not like '%NOWUSER%' and p4.sct not like '%NOW%' and p4.sct not like '%SCT_SERBBP_TVEngineer%' and p4.sct not like '%SCT_SUPSNS_HSS_TechSupp%' and p4.survey_type not like 'Dialler S%') 
+  -- added Eng/Tech Support SCTs and amended Dialler clause to work with possible inclusion of connected dialler calls over x duration. Should this whole clause be moved to P1?. Migration Legacy
+ -- remove OB calls from Eng Support. Migration Legacy
+ qualify row_number() over (partition by p4.account_number  
+                                order by p4.resource_event_end_dt desc)  =1;
+
+------------------------------------------------------------------------------------------------------------------------
+-- populate the survey_code, and rownumber basedon the below logic
+------------------------------------------------------------------------------------------------------------------------
+create temp table p6 as
+select row_number() over (partition by source,survey_code,country,survey_type_throttle order by rand())   throt_index,
+       title,
+       forename,
+       surname,
+       source,
+       survey_type,survey_type_throttle,
+       survey_code,
+       channel,
+       account_primary_mobile,
+       account_primary_email,
+       advisor_first_name,
+       account_number,
+       contact_activity,
+       src_system_id,
+       created_by_id,
+       call_date,
+       call_time,
+       cel,
+       cem,
+       sky_directorate,
+       country,
+       sct,
+       service_group_2,
+       skill_group -- remove after testing
+  from (select p5.title,
+               p5.forename,
+               p5.surname,
+               p5.source,p5.survey_type,
+               case when p5.source='Interactions' and lower(p5.survey_type) like '%sales%' 
+                    then 'sales'
+                    when p5.source='Interactions' and lower(p5.survey_type) like '%service%' 
+                    then 'service'
+                    when p5.source='Orders'
+                    then 'orders'
+                    when p5.source='Visits'
+                    then 'visits'
+                    else 'Interactions'
+                end survey_type_throttle,
+                 -- whole section re-ordered to make email primary contact option. Migration Legacy
+               case when p5.source='Interactions' and p5.account_primary_email is not null  and country !='UK' -- All ROI calls
+                    then 'email 000001'
+                    when p5.source='Interactions' and p5.survey_type like '%Sales%' and p5.account_primary_email is not null -- UK Sales calls (SG2)
+                    then 'email 000002'
+                    when p5.source='Interactions' and p5.sct like '%BuyKeep%' and p5.account_primary_email is not null -- UK Sales calls (SCT)
+                    then 'email 000002'
+                    when p5.source='Interactions' and lower(p5.directorate) like '%sales%' and p5.account_primary_email is not null -- UK Sales calls (Directorate)
+                    then 'email 000002'
+                    when p5.source='Interactions' and p5.survey_type like '%Service%' and p5.account_primary_email is not null -- All UK Service calls
+                    then 'email 000001'
+                    when p5.source='Interactions' and lower(p5.directorate) like '%service%' and p5.account_primary_email is not null -- UK Service calls (Directorate)
+                    then 'email 000001'
+               
+                    when p5.source='Interactions' and p5.account_primary_mobile is not null and country !='UK' -- All ROI calls
+                    then 'sms 000001'
+                    when p5.source='Interactions' and p5.survey_type like '%Sales%' and p5.account_primary_mobile is not null -- UK Sales calls (SG2)
+                    then 'sms 000002'  
+                    when p5.source='Interactions' and p5.sct like '%BuyKeep%' and p5.account_primary_mobile is not null -- UK Sales calls (SCT)
+                    then 'sms 000002'
+                    when p5.source='Interactions' and lower(p5.directorate) like '%sales%' and p5.account_primary_mobile is not null -- UK Sales calls (Directorate)
+                    then 'sms 000002'
+                    when p5.source='Interactions' and p5.survey_type like '%Service%' and p5.account_primary_mobile is not null -- All UK non-Sales calls
+                    then 'sms 000001'
+                    when p5.source='Interactions' and lower(p5.directorate) like '%service%' and p5.account_primary_mobile is not null -- UK Service calls (Directorate)
+                    then 'sms 000001'
+
+                    when p5.source='Visits' and p5.account_primary_email is not null
+                    then 'email 000007'
+                    when p5.source='Visits' and p5.account_primary_mobile is not null 
+                    then 'SMS 000007' -- should this be changed to lower case to match other codes? what is the impact?. Migration Legacy
+                    
+                    when p5.source='Orders' and p5.sct = 'Retail' and p5.service_group_2 != 'STS Engineers' and p5.account_primary_email is not null
+                    then 'email 000005' -- Addition for NPS006
+                    when p5.source='Orders' and p5.sct = 'Retail' and p5.service_group_2 != 'STS Engineers' and p5.account_primary_mobile is not null  
+                    then 'SMS 000005' -- should this be changed to lower case to match other codes? what is the impact?. Migration Legacy
+                    
+                    when p5.source='Orders' and p5.account_primary_email is not null and country!='UK'-- All ROI calls
+                    then 'email 000001'
+                    when p5.source='Orders' and p5.survey_type like '%Sales%' and p5.account_primary_email is not null -- UK Sales calls (SG2 not Service)
+                    then 'email 000002'
+                    when p5.source='Orders' and lower(p5.directorate) like '%sales%' and p5.account_primary_email is not null -- UK Sales calls (Directorate)
+                    then 'email 000002'
+                    when p5.source='Orders' and p5.service_group_2 in ('Direct Sell','Direct Save') and p5.account_primary_email is not null -- UK Sales calls (RTM)
+                    then 'email 000002'
+                    when p5.source='Orders' and p5.survey_type like '%Service%' and p5.account_primary_email is not null -- All UK non-Sales calls
+                    then 'email 000001'
+                    when p5.source='Orders' and lower(p5.directorate) like '%service%' and p5.account_primary_email is not null -- UK Service calls (Directorate)
+                    then 'email 000001'
+                    
+                    when p5.source='Orders' and p5.account_primary_mobile is not null and country!='UK'-- All ROI calls
+                    then 'sms 000001'
+                    when p5.source='Orders' and p5.survey_type like '%Sales%' and p5.account_primary_mobile is not null -- UK Sales calls (SG2 not Service)
+                    then 'sms 000002'
+                    when p5.source='Orders' and lower(p5.directorate) like '%sales%' and p5.account_primary_mobile is not null -- UK Sales calls (Directorate)
+                    then 'sms 000002'
+                    when p5.source='Orders' and p5.service_group_2 in ('Direct Sell','Direct Save') and p5.account_primary_mobile is not null
+                    then 'sms 000002'
+                    when p5.source='Orders' and p5.survey_type like '%Service%' and p5.account_primary_mobile is not null -- All UK non-Sales calls
+                    then 'sms 000001'
+                    when p5.source='Orders' and lower(p5.directorate) like '%service%' and p5.account_primary_mobile is not null -- UK Service calls (Directorate)
+                    then 'sms 000001'
+                    
+                    else 'unmapped' -- added to monitor overspill during change process, will be removed before moving to Prod
+                end survey_code,
+               case when p5.account_primary_email is not null 
+                    then 'Email'
+                    when  p5.account_primary_mobile is not null 
+                    then 'SMS'
+                end channel,
+               p5.account_primary_mobile,
+               p5.account_primary_email,
+               p5.advisor_first_name,
+               p5.account_number,
+               p5.contact_activity,
+               p5.src_system_id,
+               p5.created_by_id,
+               format_date('%d/%m/%Y',p5.resource_event_start_dt) call_date,
+               format_time('%H:%M:%S',time(p5.resource_event_start_dt)) call_time,
+               p5.cel,
+               p5.cem,
+               p5.directorate sky_directorate,
+               p5.country,
+               p5.sct,
+               p5.service_group_2,
+               p5.skill_group -- remove after testing
+          from p5
+         where coalesce(p5.account_primary_email, p5.account_primary_mobile) is not null
+               and account_number not in (select distinct account_number         
+                                            from p5
+                                           where (   created_by_id  like 'cc3%' 
+                                                  or created_by_id = 'sky-services'
+                                                  or  directorate  like '%Business%'))
+       qualify row_number() over (partition by coalesce(p5.account_primary_mobile,p5.account_primary_email)
+                                      order by time(p5.resource_event_start_dt)  desc)  =1)
+  where survey_code is not null;
+
+------------------------------------------------------------------------------------------------------------------------
+-- Adding value for throttle and mrn sequence
+------------------------------------------------------------------------------------------------------------------------
+create temp table p7 as
+select a.rec_count,
+       case when a.country='UK'
+            then round((a.rec_count*(100-b.uk_throttle))/100)
+        end uk_limit_count,
+       case when a.country='ROI'
+            then round((a.rec_count*(100-b.roi_throttle))/100)
+        end roi_limit_count,
+       a.source,
+       a.survey_code,
+       a.country,
+       a.survey_type_throttle,
+       b.surveycode,
+       b.source_val,
+       b.survey_type,
+       b.uk_throttle,
+       b.roi_throttle
+  from (
+       select max(throt_index) rec_count, 
+              source,
+              survey_code,
+              country,
+              survey_type_throttle
+         from p6
+        group by 2,3,4,5)a
+  left join 
+       (select concat(lower(channel),' 00000',survey_code) surveycode, 
+               case when category ='Calls – Sales' 
+                    then 'Interactions' 
+                    when category ='Calls – Service' 
+                    then 'Interactions'
+                    when category ='Retail' 
+                    then 'Orders'
+                    else category 
+                end source_val,
+               case when category ='Calls – Sales' 
+                    then 'sales' 
+                    when category ='Calls – Service' 
+                    then 'service'
+                    when category ='Retail' 
+                    then 'orders'
+                    else category 
+                end survey_type,
+               uk_throttle,
+               roi_throttle
+          from CSG_Insight_Team.ddy22_nps_throttle)b
+    on (   (a.survey_type_throttle)=lower(b.survey_type)                
+        and lower(a.source)=lower(b.source_val)
+        and lower(a.survey_code) = lower(b.surveycode) );
+
+------------------------------------------------------------------------------------------------------------------------
+-- Limit the record present in p6 table for the throttle value
+------------------------------------------------------------------------------------------------------------------------
+create temp table p8 as
+select row_number() over()         row_index,
+       p6.throt_index,
+       p6.title,
+       p6.forename,
+       p6.surname,
+       p6.source,
+       p6.survey_type,
+       p6.survey_type_throttle,
+       p6.survey_code,
+       p6.channel,
+       p6.account_primary_mobile,
+       p6.account_primary_email,
+       p6.advisor_first_name,
+       p6.account_number,
+       p6.contact_activity,
+       p6.src_system_id,
+       p6.created_by_id,
+       p6.call_date,
+       p6.call_time,
+       p6.cel,
+       p6.cem,
+       p6.sky_directorate,
+       p6.country,
+       p6.sct,
+       p6.service_group_2,
+       p6.skill_group -- remove after testing
+  from  p6
+ inner join  p7
+    on (    lower(p6.source)=lower(p7.source)
+        and lower(p6.survey_code)=lower(p7.survey_code)
+        and lower(p6.survey_type_throttle)=lower(p7.survey_type_throttle) 
+        and p6.country=p7.country
+        and p6.throt_index <=coalesce(p7.uk_limit_count,p7.roi_limit_count,p7.rec_count));
+        
+------------------------------------------------------------------------------------------------------------------------
+-- Generate the array for the count present in the p8 table
+------------------------------------------------------------------------------------------------------------------------
+create temp table p9 as
+select generate_array(thr.next_seq ,thr.next_seq+p8.countval,1) seq_array
+  from (select count(1)  countval 
+          from p8) p8
+ inner join throttle thr
+    on 1=1;
+    
+------------------------------------------------------------------------------------------------------------------------
+-- splitting up the array and then adding rownumber
+-- to join with the actual data
+------------------------------------------------------------------------------------------------------------------------
+create temp table p10 as
+select mrn,
+       row_number() over()  throttle_index
+  from p9, unnest(seq_array)  mrn;
+  
+------------------------------------------------------------------------------------------------------------------------
+-- joining p8 and p10 to populate the mrn series based on rowindex and throttle index
+------------------------------------------------------------------------------------------------------------------------
+create or replace table CSG_Insight_Team.ddy22_nps_solicitation_v2 as
+--insert CSG_Insight_Team.ddy22_nps_solicitation_v2
+select p10.mrn,
+       p8.title,
+       p8.forename,
+       p8.surname,
+       p8.source,
+       p8.survey_code,
+       p8.channel,
+       p8.account_primary_mobile,
+       p8.account_primary_email,
+       p8.advisor_first_name,
+       p8.account_number,
+       p8.contact_activity,
+       p8.src_system_id,
+       p8.created_by_id,
+       p8.call_date,
+       p8.call_time,
+       p8.cel,
+       p8.cem,
+       p8.sky_directorate,
+       p8.country,
+       case when p8.source='Interactions' 
+            then substring(p8.sct,4)
+            else p8.sct  -- added for Visit & Order info 
+            end service_call_type,
+       p8.service_group_2,
+       p8.skill_group -- remove after testing
+  from p8
+ inner join p10
+    on p8.row_index=p10.throttle_index;
